@@ -16,13 +16,26 @@
 
 package com.hazelcast.cluster.impl;
 
+import com.amazonaws.auth.DefaultAWSCredentialsProviderChain;
+import com.amazonaws.services.ecs.AmazonECS;
+import com.amazonaws.services.ecs.AmazonECSClientBuilder;
+import com.amazonaws.services.ecs.model.*;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.hazelcast.aws.AWSClient;
 import com.hazelcast.config.AwsConfig;
 import com.hazelcast.instance.Node;
 import com.hazelcast.logging.ILogger;
 import com.hazelcast.util.ExceptionUtil;
+import okhttp3.OkHttpClient;
+import okhttp3.Request;
+import okhttp3.Response;
 
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.List;
+
+import static java.lang.String.format;
 
 public class TcpIpJoinerOverAWS extends TcpIpJoiner {
 
@@ -39,23 +52,72 @@ public class TcpIpJoinerOverAWS extends TcpIpJoiner {
     @Override
     protected Collection<String> getMembers() {
         try {
-            Collection<String> list = aws.getPrivateIpAddresses();
-            if (list.isEmpty()) {
-                logger.warning("No EC2 instances found!");
+            Collection<String> machineIps = aws.getPrivateIpAddresses();
+            List<String> taskIps = getEcsTaskEniAddress();
+            ArrayList<String> addresses = new ArrayList<String>(machineIps.size() + taskIps.size());
+            addresses.addAll(machineIps);
+            addresses.addAll(taskIps);
+            if (addresses.isEmpty()) {
+                logger.warning("No EC2 instances or ESC task found!");
             } else {
                 if (logger.isFinestEnabled()) {
                     StringBuilder sb = new StringBuilder("Found the following EC2 instances:\n");
-                    for (String ip : list) {
+                    for (String ip : addresses) {
                         sb.append("    ").append(ip).append("\n");
                     }
                     logger.finest(sb.toString());
                 }
             }
-            return list;
+            return addresses;
         } catch (Exception e) {
             logger.warning(e);
             throw ExceptionUtil.rethrow(e);
         }
+    }
+
+    private List<String> getEcsTaskEniAddress() {
+        List<String> ips = new ArrayList<String>();
+        try {
+            String containerMetaData = System.getenv("ECS_CONTAINER_METADATA_URI");
+            if (containerMetaData == null || containerMetaData.isEmpty()) {
+                throw new IllegalArgumentException("ECS_CONTAINER_METADATA_URI not set in ecs config");
+            }
+            OkHttpClient client = new OkHttpClient().newBuilder().build();
+            Request request = new Request.Builder().url(containerMetaData).get().build();
+            Response response = client.newCall(request).execute();
+            ObjectMapper mapper = new ObjectMapper();
+            final JsonNode jsonNode = mapper.readValue(response.body().bytes(), JsonNode.class);
+            String cluster = jsonNode.get("Labels").get("com.amazonaws.ecs.cluster").asText();
+            String family = jsonNode.get("Labels").get("com.amazonaws.ecs.task-definition-family").asText();
+            logger.info(format("Found cluster %s, family name %s", cluster, family));
+            final AmazonECS amazonECS = AmazonECSClientBuilder.standard()
+                    .withCredentials(DefaultAWSCredentialsProviderChain.getInstance())
+                    //.withRegion("eu-west-1")
+                    .build();
+
+            ListTasksResult listTasksResult = amazonECS.listTasks(new ListTasksRequest().withCluster(cluster).withFamily(family));
+            while (listTasksResult == null || listTasksResult.getTaskArns().isEmpty()) {
+                Thread.sleep(2000);
+                listTasksResult = amazonECS.listTasks(new ListTasksRequest().withCluster(cluster).withFamily(family));
+            }
+            listTasksResult = amazonECS.listTasks(new ListTasksRequest().withCluster(cluster).withFamily(family));
+            if (listTasksResult != null && !listTasksResult.getTaskArns().isEmpty()) {
+                logger.info(listTasksResult.getTaskArns().toString());
+
+                final List<Task> tasks = amazonECS.describeTasks(new DescribeTasksRequest().withCluster(cluster)
+                        .withTasks(listTasksResult.getTaskArns())).getTasks();
+                logger.info(tasks.toString());
+                for (Task a : tasks) {
+                    for (Container c : a.getContainers()) {
+                        ips.add(c.getNetworkInterfaces().get(0).getPrivateIpv4Address());
+                    }
+                }
+                logger.finest(format("Ecs task private IP addresses : %s", ips));
+            }
+        } catch (Exception e) {
+            logger.severe(e);
+        }
+        return ips;
     }
 
     @Override
