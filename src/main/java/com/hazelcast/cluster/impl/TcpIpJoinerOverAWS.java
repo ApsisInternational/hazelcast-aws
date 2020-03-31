@@ -33,6 +33,7 @@ import okhttp3.Response;
 
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.List;
 
 import static java.lang.String.format;
@@ -52,7 +53,8 @@ public class TcpIpJoinerOverAWS extends TcpIpJoiner {
     @Override
     protected Collection<String> getMembers() {
         try {
-            Collection<String> machineIps = aws.getPrivateIpAddresses();
+//            Collection<String> machineIps = aws.getPrivateIpAddresses();
+            Collection<String> machineIps = Collections.emptySet();
             List<String> taskIps = getEcsTaskEniAddress();
             ArrayList<String> addresses = new ArrayList<String>(machineIps.size() + taskIps.size());
             addresses.addAll(machineIps);
@@ -89,7 +91,7 @@ public class TcpIpJoinerOverAWS extends TcpIpJoiner {
             final JsonNode jsonNode = mapper.readValue(response.body().bytes(), JsonNode.class);
             String cluster = jsonNode.get("Labels").get("com.amazonaws.ecs.cluster").asText();
             String family = jsonNode.get("Labels").get("com.amazonaws.ecs.task-definition-family").asText();
-            logger.info(format("Found cluster %s, family name %s", cluster, family));
+            logger.finest(format("Found cluster %s, family name %s", cluster, family));
             final AmazonECS amazonECS = AmazonECSClientBuilder.standard()
                     .withCredentials(DefaultAWSCredentialsProviderChain.getInstance())
                     //.withRegion("eu-west-1")
@@ -102,11 +104,11 @@ public class TcpIpJoinerOverAWS extends TcpIpJoiner {
             }
             listTasksResult = amazonECS.listTasks(new ListTasksRequest().withCluster(cluster).withFamily(family));
             if (listTasksResult != null && !listTasksResult.getTaskArns().isEmpty()) {
-                logger.info(listTasksResult.getTaskArns().toString());
+                logger.finest(listTasksResult.getTaskArns().toString());
 
                 final List<Task> tasks = amazonECS.describeTasks(new DescribeTasksRequest().withCluster(cluster)
                         .withTasks(listTasksResult.getTaskArns())).getTasks();
-                logger.info(tasks.toString());
+                logger.finest(tasks.toString());
                 for (Task a : tasks) {
                     for (Container c : a.getContainers()) {
                         ips.add(c.getNetworkInterfaces().get(0).getPrivateIpv4Address());
